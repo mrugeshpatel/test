@@ -11,7 +11,7 @@ from typing import AsyncGenerator
 from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
-from db import get_pool
+from aws_secrets import get_pool
 from graph.builder import build_graph_from_agent
 from graph.checkpointer import init_langgraph
 
@@ -79,7 +79,7 @@ async def chat(request: Request, body: ChatRequest, pool=Depends(get_pool)):
 
     # Run graph
     thread_id = session["thread_id"] or str(session["id"])
-    config    = {"configurable": {"thread_id": thread_id}}
+    config = {"configurable": {"thread_id": thread_id, "pool": pool}}
 
     try:
         result = await graph.ainvoke(
@@ -184,7 +184,7 @@ async def chat_ws(websocket: WebSocket, session_id: str, pool=Depends(get_pool))
                 graph        = build_graph_from_agent(agent_dict, checkpointer, store)
 
                 thread_id = session["thread_id"] or str(session["id"])
-                config    = {"configurable": {"thread_id": thread_id}}
+                config = {"configurable": {"thread_id": thread_id, "pool": pool}}
 
                 async for event in graph.astream_events(
                     {"messages": [{"role": "user", "content": content}]},
