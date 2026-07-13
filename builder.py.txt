@@ -1,7 +1,6 @@
 """
 graph/builder.py
 Builds a LangGraph StateGraph dynamically from workflow.graph_config JSONB.
-Called by the chat route on every new session.
 """
 
 import logging
@@ -15,9 +14,6 @@ from graph.nodes import (
     find_company_node,
     company_details_node,
     generate_letter_node,
-    match_style_node,
-    screen_companies_node,
-    rank_opportunities_node,
 )
 
 logger = logging.getLogger(__name__)
@@ -25,12 +21,9 @@ logger = logging.getLogger(__name__)
 # ── Node registry ────────────────────────────────────────────
 # Maps skill.name (LangGraph node ID) → async node function
 NODE_REGISTRY: dict[str, Any] = {
-    "find-company":        find_company_node,
-    "company-details":     company_details_node,
-    "generate-letter":     generate_letter_node,
-    "match-style":         match_style_node,
-    "screen-companies":    screen_companies_node,
-    "rank-opportunities":  rank_opportunities_node,
+    "find-company":    find_company_node,
+    "company-details": company_details_node,
+    "generate-letter": generate_letter_node,
 }
 
 
@@ -40,41 +33,18 @@ def build_graph(
     checkpointer=None,
     store=None,
 ):
-    """
-    Build and compile a StateGraph from graph_config JSONB.
-
-    graph_config shape (stored in workflow.graph_config):
-    {
-        "nodes": [
-            {
-                "id": "find-company",
-                "is_entry_point": true,
-                "is_terminal": false,
-                "next": "company-details",
-                "condition": null,
-                "enabled": true
-            },
-            ...
-        ]
-    }
-
-    Returns compiled LangGraph graph.
-    """
     nodes = graph_config.get("nodes", [])
 
     if not nodes:
         raise ValueError("graph_config has no nodes — agent has no workflow skills configured")
 
-    # Filter disabled nodes
     active_nodes = [n for n in nodes if n.get("enabled", True)]
 
     if not active_nodes:
         raise ValueError("All workflow steps are disabled — enable at least one step")
 
-    # Build graph
     builder = StateGraph(AgentState)
 
-    # Add nodes
     for node in active_nodes:
         node_id = node["id"]
         if node_id not in NODE_REGISTRY:
@@ -83,33 +53,28 @@ def build_graph(
         builder.add_node(node_id, NODE_REGISTRY[node_id])
         logger.debug(f"Added node: {node_id}")
 
-    # Add edges
     entry_added = False
     for node in active_nodes:
         node_id = node["id"]
         if node_id not in NODE_REGISTRY:
             continue
 
-        # Entry point → START
         if node.get("is_entry_point") and not entry_added:
             builder.add_edge(START, node_id)
             entry_added = True
             logger.debug(f"START → {node_id}")
 
-        # Terminal → END
         if node.get("is_terminal"):
             builder.add_edge(node_id, END)
             logger.debug(f"{node_id} → END")
             continue
 
-        # Next skill (explicit routing)
-        next_id = node.get("next")
+        next_id   = node.get("next")
         condition = node.get("condition")
 
         if next_id and next_id in NODE_REGISTRY:
             if condition:
-                # Conditional edge
-                def make_condition(cond: str, nxt: str, curr: str):
+                def make_condition(cond: str, nxt: str):
                     def route(state: AgentState) -> str:
                         try:
                             result = eval(cond, {}, dict(state))
@@ -118,29 +83,24 @@ def build_graph(
                             logger.warning(f"Condition eval failed ({cond}): {e}")
                             return nxt
                     return route
-
                 builder.add_conditional_edges(
                     node_id,
-                    make_condition(condition, next_id, node_id),
+                    make_condition(condition, next_id),
                     {next_id: next_id, END: END}
                 )
-                logger.debug(f"{node_id} → (condition: {condition}) → {next_id}")
             else:
                 builder.add_edge(node_id, next_id)
                 logger.debug(f"{node_id} → {next_id}")
         else:
-            # Default: route to END if no next defined and not terminal
             builder.add_edge(node_id, END)
             logger.debug(f"{node_id} → END (default)")
 
-    # If no entry point was set, use first active node
     if not entry_added and active_nodes:
         first_id = active_nodes[0]["id"]
         if first_id in NODE_REGISTRY:
             builder.add_edge(START, first_id)
-            logger.debug(f"START → {first_id} (fallback — no entry_point set)")
+            logger.debug(f"START → {first_id} (fallback)")
 
-    # Compile
     compile_kwargs: dict[str, Any] = {}
 
     if checkpointer:
@@ -150,9 +110,10 @@ def build_graph(
         compile_kwargs["store"] = store
 
     if interrupt_before:
-        # Only interrupt on nodes that exist in this graph
-        valid_interrupts = [n for n in interrupt_before if n in NODE_REGISTRY
-                           and any(node["id"] == n for node in active_nodes)]
+        valid_interrupts = [
+            n for n in interrupt_before
+            if n in NODE_REGISTRY and any(node["id"] == n for node in active_nodes)
+        ]
         if valid_interrupts:
             compile_kwargs["interrupt_before"] = valid_interrupts
             logger.info(f"Interrupt before: {valid_interrupts}")
@@ -163,26 +124,19 @@ def build_graph(
 
 
 def build_graph_from_agent(agent: dict, checkpointer=None, store=None):
-    """
-    Convenience wrapper — build graph directly from agent dict
-    as returned by GET /api/agents/:id.
-    Falls back to MemorySaver if no checkpointer provided.
-    """
-    graph_config = agent.get("graph_config") or {}
+    graph_config     = agent.get("graph_config") or {}
     interrupt_before = agent.get("interrupt_before") or []
 
     if not graph_config:
-        # Build graph_config from workflow_skills if graph_config not pre-built
         workflow_skills = agent.get("workflow_skills") or []
         if not workflow_skills:
             raise ValueError(
-                f"Agent '{agent.get('name')}' has no workflow skills configured. "
-                "Add skills in Create agent → Workflow section."
+                f"Agent '{agent.get('name')}' has no workflow skills configured."
             )
         graph_config = _build_config_from_skills(workflow_skills)
 
     if not checkpointer:
-        logger.warning("No checkpointer provided — using MemorySaver (no persistence)")
+        logger.warning("No checkpointer — using MemorySaver")
         checkpointer = MemorySaver()
 
     return build_graph(
@@ -194,19 +148,19 @@ def build_graph_from_agent(agent: dict, checkpointer=None, store=None):
 
 
 def _build_config_from_skills(workflow_skills: list[dict]) -> dict:
-    """
-    Build graph_config JSONB from workflow_skill rows
-    when graph_config hasn't been pre-built server-side.
-    """
     nodes = []
     for i, skill in enumerate(workflow_skills):
+        next_skill = None
+        if i + 1 < len(workflow_skills):
+            next_skill = (
+                workflow_skills[i + 1].get("skill_name")
+                or workflow_skills[i + 1].get("name")
+            )
         nodes.append({
             "id":             skill.get("skill_name") or skill.get("name"),
             "is_entry_point": skill.get("is_entry_point", i == 0),
             "is_terminal":    skill.get("is_terminal", i == len(workflow_skills) - 1),
-            "next":           skill.get("next_skill_id") or (
-                workflow_skills[i + 1].get("skill_name") if i + 1 < len(workflow_skills) else None
-            ),
+            "next":           skill.get("next_skill_id") or next_skill,
             "condition":      skill.get("condition"),
             "enabled":        skill.get("enabled", True),
         })
