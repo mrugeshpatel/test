@@ -1,0 +1,33 @@
+async def _call_claude(prompt: str, system: str, pool: asyncpg.Pool) -> str:
+    import boto3
+    import json
+
+    bedrock = boto3.client("bedrock-runtime", region_name="eu-west-2")
+
+    body = json.dumps({
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": 4096,
+        "system": [                          # ← change from string to list
+            {
+                "type": "text",
+                "text": system,
+                "cache_control": {
+                    "type": "ephemeral",
+                    "ttl":  "1h"             # ← 1 hour TTL
+                }
+            }
+        ],
+        "messages": [
+            {"role": "user", "content": prompt}
+        ],
+    })
+
+    response = bedrock.invoke_model(
+        modelId     = "anthropic.claude-sonnet-4-5-20250929-v1:0",  # ← must be 4.5 for 1h TTL
+        contentType = "application/json",
+        accept      = "application/json",
+        body        = body,
+    )
+
+    result = json.loads(response["body"].read())
+    return result["content"][0]["text"]
