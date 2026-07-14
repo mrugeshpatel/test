@@ -1,0 +1,5 @@
+ALTER TABLE checkpoint_writes ADD COLUMN IF NOT EXISTS task_path TEXT;
+ALTER TABLE checkpoint_writes ADD COLUMN IF NOT EXISTS task_id   TEXT;
+ALTER TABLE checkpoint_blobs  ADD COLUMN IF NOT EXISTS blob_id   TEXT;
+ALTER TABLE checkpoints       ADD COLUMN IF NOT EXISTS pending_sends BYTEA;
+ALTER TABLE checkpoints       ADD COLUMN IF NOT EXISTS checkpoint_ns TEXT NOT NULL DEFAULT '';
