@@ -1,292 +1,83 @@
-"""
-graph/nodes.py
-LangGraph node functions for the Activism Agent.
-Each node:
-  1. Loads skill from DB
-  2. Reads last user message from state
-  3. Calls Claude via Bedrock with prompt caching on system prompt
-"""
+const express = require('express');
+const { createProxyMiddleware } = require('http-proxy-middleware');
+const path = require('path');
+const http = require('http');
 
-import json
-import logging
-import boto3
-import asyncpg
+const app         = express();
+const PORT        = process.env.PORT        || 3169;
+const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:8274';
 
-from graph.state import AgentState
-from graph.rag   import get_rag_context
+console.log(`BACKEND_URL: ${BACKEND_URL}`);
+console.log(`NODE_ENV:    ${process.env.NODE_ENV}`);
 
-logger  = logging.getLogger(__name__)
-bedrock = boto3.client("bedrock-runtime", region_name="eu-west-2")
+// ── Health check (before auth — ALB needs 200 without X-User-ID) ──
+app.get('/health', (req, res) => {
+    res.status(200).json({ status: 'ok', service: 'activism-ui' });
+});
 
-MODEL_ID = "anthropic.claude-sonnet-4-5-20250929-v1:0"
-
-
-# ── Helpers ──────────────────────────────────────────────────
-
-async def _load_skill(pool: asyncpg.Pool, skill_name: str) -> dict | None:
-    """Load full skill row from DB by name."""
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow("""
-            SELECT s.*, ds.name as ds_name, ds.query as ds_query, ds.enabled as ds_enabled
-            FROM skill s
-            LEFT JOIN data_source ds ON ds.id = s.data_source_id
-            WHERE s.name = $1 AND s.enabled = true
-        """, skill_name)
-    return dict(row) if row else None
-
-
-def _last_user_message(state: AgentState) -> str:
-    """Extract last user message from state."""
-    for msg in reversed(state.get("messages", [])):
-        if isinstance(msg, dict) and msg.get("role") == "user":
-            return msg.get("content", "")
-        if hasattr(msg, "type") and msg.type == "human":
-            return msg.content
-    return ""
-
-
-async def _call_claude(
-    skill_content:  str,
-    system_prompt:  str,
-    guardrails:     str,
-    user_message:   str,
-) -> str:
-    """
-    Call Claude via Bedrock.
-    System block (skill + system_prompt + guardrails) is marked for
-    Bedrock prompt caching with 1-hour TTL — cached after first call,
-    subsequent calls within 1 hour are fast and up to 90% cheaper.
-    """
-
-    # Build cached system content — static between requests
-    system_text = "\n\n".join(filter(None, [
-        skill_content,
-        system_prompt,
-        f"Guardrails:\n{guardrails}" if guardrails else "",
-    ]))
-
-    body = json.dumps({
-        "anthropic_version": "bedrock-2023-05-31",
-        "max_tokens": 4096,
-        "system": [
-            {
-                "type": "text",
-                "text": system_text,
-                "cache_control": {
-                    "type": "ephemeral",
-                    "ttl":  "1h",       # 1-hour TTL — resets on each cache hit
-                }
-            }
-        ],
-        "messages": [
-            {"role": "user", "content": user_message}
-        ],
-    })
-
-    response = bedrock.invoke_model(
-        modelId     = MODEL_ID,
-        contentType = "application/json",
-        accept      = "application/json",
-        body        = body,
-    )
-
-    result = json.loads(response["body"].read())
-
-    # Log cache usage for monitoring
-    usage = result.get("usage", {})
-    logger.info(
-        f"Bedrock usage — input: {usage.get('input_tokens')} "
-        f"cache_write: {usage.get('cache_creation_input_tokens', 0)} "
-        f"cache_read: {usage.get('cache_read_input_tokens', 0)} "
-        f"output: {usage.get('output_tokens')}"
-    )
-
-    return result["content"][0]["text"]
-
-
-def _get_configurable(config: dict) -> dict:
-    """Extract configurable dict from LangGraph config."""
-    return config.get("configurable", {})
-
-
-def _get_memory(config: dict) -> dict | None:
-    user_id  = config.get("configurable", {}).get("user_id",  "")
-    agent_id = config.get("configurable", {}).get("agent_id", "")
-    """Read long-term memory from LangGraph store."""
-    try:
-        from langgraph.config import get_store
-        store = get_store()
-        if store is None:
-            return None
-        item = store.get((user_id, agent_id), "last_session")
-        return item.value if item else None
-    except Exception as e:
-        logger.warning(f"Memory read failed: {e}")
-        return None
-
-
-async def _save_memory(pool: asyncpg.Pool, thread_id: str, state: AgentState, user_id: str = "", agent_id: str = "") -> None:
-    """Save memory snapshot to chat_session table and LangGraph store."""
-    snapshot = {
-        "last_company":  state.get("company"),
-        "last_activist": state.get("activist_style"),
-        "last_letter":   (state.get("letter_draft") or "")[:300],
+// ── Auth middleware ───────────────────────────────────────────
+app.use((req, res, next) => {
+    const userId = req.headers['x-user-id'];
+    if (!userId) {
+        if (process.env.NODE_ENV === 'development') {
+            req.headers['x-user-id'] = process.env.DEV_USER_ID || 'dev-user';
+        } else {
+            return res.status(401).json({ error: 'Unauthorised' });
+        }
     }
+    next();
+});
 
-    # Save to DB for MemoryBanner in UI
-    try:
-        async with pool.acquire() as conn:
-            await conn.execute("""
-                UPDATE chat_session
-                SET memory_snapshot = $1, updated_on = NOW()
-                WHERE thread_id = $2
-            """, json.dumps(snapshot), thread_id)
-    except Exception as e:
-        logger.warning(f"memory_snapshot DB save failed: {e}")
+// ── API proxy — /backend/api/* → backend /api/* ───────────────
+app.use('/backend/api', createProxyMiddleware({
+    target:       BACKEND_URL + '/api',
+    changeOrigin: true,
+    pathRewrite:  { '^/backend/api': '' },
+    on: {
+        proxyReq: (proxyReq, req) => {
+            proxyReq.setHeader('x-user-id', req.headers['x-user-id'] || '');
+            console.log(`API proxy: ${req.method} ${req.url} → ${BACKEND_URL}/api${req.url}`);
+        },
+        error: (err, req, res) => {
+            console.error('API proxy error:', err.message);
+            res.status(502).json({ error: 'Backend unavailable', detail: err.message });
+        },
+    },
+}));
 
-    # Save to LangGraph store
-    try:
-        from langgraph.config import get_store
-        store = get_store()
-        if store:
-            store.put((user_id, agent_id), "last_session", snapshot)
-    except Exception as e:
-        logger.warning(f"LangGraph store save failed: {e}")
+// ── WebSocket proxy — /backend/ws/* → backend /ws/* ──────────
+const wsProxy = createProxyMiddleware({
+    target:       BACKEND_URL,
+    changeOrigin: true,
+    ws:           true,
+    pathRewrite:  { '^/backend/ws': '/ws' },
+    on: {
+        proxyReqWs: (proxyReq, req) => {
+            proxyReq.setHeader('x-user-id', req.headers['x-user-id'] || '');
+            console.log(`WS proxy: ${req.url}`);
+        },
+        error: (err, req, res) => {
+            console.error('WS proxy error:', err.message);
+        },
+    },
+});
 
+app.use('/backend/ws', wsProxy);
 
-# ── Nodes ─────────────────────────────────────────────────────
+// ── Static files ──────────────────────────────────────────────
+app.use(express.static(path.join(__dirname, 'dist')));
 
-async def find_company_node(state: AgentState, config) -> AgentState:
-    """
-    Node: find-company
-    Search FactSet for the target company mentioned by the user.
-    """
-    cfg           = _get_configurable(config)
-    pool          = cfg.get("pool")
-    system_prompt = cfg.get("system_prompt", "")
-    guardrails    = cfg.get("guardrails",    "")
+// ── SPA fallback ──────────────────────────────────────────────
+app.get('*', (req, res) => {
+    res.sendFile(path.join(__dirname, 'dist', 'index.html'));
+});
 
-    skill = await _load_skill(pool, "find-company")
-    if not skill:
-        logger.error("Skill 'find-company' not found or disabled")
-        return {**state, "messages": state["messages"] + [
-            {"role": "assistant", "content": "Error: find-company skill not configured."}
-        ]}
+// ── Start server via http.createServer (required for WS) ─────
+const server = http.createServer(app);
 
-    user_msg = _last_user_message(state)
+// Handle WebSocket upgrade handshake
+server.on('upgrade', wsProxy.upgrade);
 
-    # Enrich with long-term memory context
-    memory = _get_memory(config)
-    memory_note = ""
-    if memory and memory.get("last_company"):
-        memory_note = (
-            f"\n\nPrevious session: last company = {memory['last_company']}, "
-            f"activist = {memory.get('last_activist', 'unknown')}."
-        )
-
-    logger.info("find_company_node: calling Claude")
-    response = await _call_claude(
-        skill_content = skill["content"] + memory_note,
-        system_prompt = system_prompt,
-        guardrails    = guardrails,
-        user_message  = user_msg,
-    )
-
-    return {
-        **state,
-        "company":  response,
-        "messages": state["messages"] + [{"role": "assistant", "content": response}],
-    }
-
-
-async def company_details_node(state: AgentState, config) -> AgentState:
-    """
-    Node: company-details
-    Pull full FactSet company profile for the identified company.
-    """
-    cfg           = _get_configurable(config)
-    pool          = cfg.get("pool")
-    system_prompt = cfg.get("system_prompt", "")
-    guardrails    = cfg.get("guardrails",    "")
-
-    skill = await _load_skill(pool, "company-details")
-    if not skill:
-        logger.error("Skill 'company-details' not found or disabled")
-        return state
-
-    company  = state.get("company", "")
-    user_msg = f"Pull full company profile for: {company}"
-
-    logger.info(f"company_details_node: fetching details for {company}")
-    response = await _call_claude(
-        skill_content = skill["content"],
-        system_prompt = system_prompt,
-        guardrails    = guardrails,
-        user_message  = user_msg,
-    )
-
-    return {
-        **state,
-        "factset_data": {"raw": response},
-        "messages":     state["messages"] + [{"role": "assistant", "content": response}],
-    }
-
-
-async def generate_letter_node(state: AgentState, config) -> AgentState:
-    """
-    Node: generate-letter
-    Generate activism letter using skill content + RAG activist style context.
-    Saves memory snapshot after generation.
-    """
-    cfg           = _get_configurable(config)
-    pool          = cfg.get("pool")
-    thread_id     = cfg.get("thread_id", "")
-    system_prompt = cfg.get("system_prompt", "")
-    guardrails    = cfg.get("guardrails",    "")
-
-    skill = await _load_skill(pool, "generate-letter")
-    if not skill:
-        logger.error("Skill 'generate-letter' not found or disabled")
-        return state
-
-    company      = state.get("company",        "")
-    factset_data = state.get("factset_data",   {})
-    activist     = state.get("activist_style", "")
-
-    # RAG context from pgvector
-    rag_context = ""
-    try:
-        rag_context = await get_rag_context(pool, activist or company)
-    except Exception as e:
-        logger.warning(f"RAG context failed: {e}")
-
-    user_msg = f"""
-Company:       {company}
-FactSet data:  {factset_data}
-Activist:      {activist}
-Style context: {rag_context}
-
-Generate a shareholder activism letter for the above company.
-"""
-
-    logger.info(f"generate_letter_node: generating letter for {company}")
-    letter = await _call_claude(
-        skill_content = skill["content"],
-        system_prompt = system_prompt,
-        guardrails    = guardrails,
-        user_message  = user_msg.strip(),
-    )
-
-    # Save long-term memory
-    await _save_memory(
-        pool, thread_id,
-        {**state, "letter_draft": letter},
-        cfg.get("user_id",  ""),
-        cfg.get("agent_id", ""),
-    )
-
-    return {
-        **state,
-        "letter_draft": letter,
-        "messages":     state["messages"] + [{"role": "assistant", "content": letter}],
-    }
+server.listen(PORT, () => {
+    console.log(`UI server running on port ${PORT}`);
+});
