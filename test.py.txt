@@ -1,0 +1,20 @@
+@router.patch("/skills/workflow/{workflow_skill_id}")
+async def toggle_workflow_skill(
+    workflow_skill_id: UUID,
+    request: Request,
+    body: dict,
+):
+    enabled = body.get("enabled", True)
+    async with request.app.state.pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id FROM workflow_skill WHERE id = $1",
+            workflow_skill_id
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail="Workflow skill not found")
+
+        await conn.execute("""
+            UPDATE workflow_skill SET enabled = $1 WHERE id = $2
+        """, enabled, workflow_skill_id)
+
+    return {"id": str(workflow_skill_id), "enabled": enabled}
