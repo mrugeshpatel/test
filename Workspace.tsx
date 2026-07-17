@@ -1,146 +1,111 @@
-import { useState, useEffect } from 'react';
-import { useParams, useNavigate } from 'react-router-dom';
-import { useAgent }     from '../hooks/useAgent';
-import { useChat }      from '../hooks/useChat';
-import { useWebSocket } from '../hooks/useWebSocket';
-import Sidebar          from '../components/Sidebar';
-import MemoryBanner     from '../components/MemoryBanner';
-import WorkflowPanel    from '../components/WorkflowPanel';
-import ExecutionLog     from '../components/ExecutionLog';
-import ChatWindow       from '../components/ChatWindow';
-import { createSession, fetchMessages } from '../api/sessions';
-import { ChatSession } from '../types';
+import { useState } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { WorkflowSkill, AgentStatus } from '../types';
 
-export default function Workspace() {
-    const { agentId } = useParams<{ agentId: string }>();
-    const navigate    = useNavigate();
+interface Props {
+    skills:  WorkflowSkill[];
+    status:  AgentStatus | null;
+    agentId?: string;
+}
 
-    const { agent, workflowSkills, sessions, setSessions, status, loading } = useAgent(agentId);
-    const [activeSession, setActiveSession] = useState<ChatSession | null>(null);
-    const { messages, setMessages, sending, send, letterDraft } = useChat(activeSession?.id || null);
-    const { logs, connected } = useWebSocket(activeSession?.id || null);
-    const [input, setInput] = useState('');
+export default function WorkflowPanel({ skills, status, agentId }: Props) {
+    const [open,          setOpen]          = useState(false);
+    const [localSkills,   setLocalSkills]   = useState<WorkflowSkill[]>(skills);
+    const navigate = useNavigate();
 
-    // ── Auto-select most recent session, or create one if none exist ──
-    useEffect(() => {
-        if (loading) return;
-        if (sessions.length > 0) {
-            // Auto-select the most recent session
-            const latest = sessions[0];
-            setActiveSession(latest);
-            fetchMessages(latest.id).then(setMessages).catch(console.error);
-        } else if (agentId && sessions.length === 0) {
-            // No sessions yet — auto-create one
-            handleNewSession();
-        }
-    }, [loading, agentId]);
+    // Sync if parent skills change
+    useState(() => { setLocalSkills(skills); });
 
-    // ── Load messages when session changes ──
-    useEffect(() => {
-        if (!activeSession) return;
-        fetchMessages(activeSession.id).then(setMessages).catch(console.error);
-    }, [activeSession?.id]);
+    const toggleSkill = async (skill: WorkflowSkill) => {
+        const updated = { ...skill, enabled: !skill.enabled };
+        setLocalSkills(prev => prev.map(s => s.id === skill.id ? updated : s));
 
-    const handleNewSession = async () => {
-        if (!agentId) return;
+        // Persist to backend
         try {
-            const session = await createSession(agentId);
-            setSessions(prev => [session, ...prev]);
-            setActiveSession(session);
-            setMessages([]);
+            await fetch(`/backend/api/agents/${agentId}/skills/${skill.id}`, {
+                method:  'PATCH',
+                headers: { 'Content-Type': 'application/json' },
+                body:    JSON.stringify({ enabled: updated.enabled }),
+            });
         } catch (e) {
-            console.error('Failed to create session:', e);
+            console.error('Failed to update skill:', e);
+            // Revert on error
+            setLocalSkills(prev => prev.map(s => s.id === skill.id ? skill : s));
         }
     };
 
-    const handleSelectSession = (s: ChatSession) => {
-        setActiveSession(s);
-        setMessages([]);
-    };
-
-    const handleSend = () => {
-        if (!input.trim() || !activeSession) return;
-        send(input);
-        setInput('');
-    };
-
-    if (loading) return <div className='loading'>Loading agent...</div>;
-    if (!agent)  return <div className='error'>Agent not found</div>;
+    const activeCount = localSkills.filter(s => s.enabled).length;
 
     return (
-        <div className='workspace'>
-            <Sidebar
-                agent={agent}
-                sessions={sessions}
-                activeSession={activeSession}
-                onSelectSession={handleSelectSession}
-                onNewSession={handleNewSession}
-                onHome={() => navigate('/')}
-            />
-            <div className='ws-main'>
-                <div className='ws-topbar'>
-                    <span className='ws-agent-name'>{agent.display_name}</span>
-                    <div style={{ display: 'flex', gap: 6 }}>
-                        <button className='btn-primary'
-                            onClick={() => navigate(`/agent/${agentId}`)}>
-                            Edit agent
-                        </button>
-                        <button className='back-btn' onClick={() => navigate('/')}>
-                            ← Home
-                        </button>
-                    </div>
-                </div>
-
-                <div className='ws-content'>
-                    {agent.memory_snapshot && (
-                        <MemoryBanner memory={agent.memory_snapshot as Record<string, unknown>} />
-                    )}
-                    <WorkflowPanel
-                        skills={workflowSkills}
-                        status={status}
-                        agentId={agentId}
-                    />
-                    <ExecutionLog logs={logs} connected={connected} />
-                </div>
-
-                <div className='chat-section'>
-                    <div className='chat-label'>
-                        Chat
-                        {activeSession && (
-                            <span style={{ fontWeight: 400, color: '#6B7280', marginLeft: 8 }}>
-                                — {activeSession.title || 'New session'}
-                            </span>
-                        )}
-                    </div>
-
-                    {!activeSession ? (
-                        <div className='loading'>Starting session...</div>
-                    ) : (
-                        <>
-                            <ChatWindow messages={messages} letterDraft={letterDraft} />
-                            <div className='chat-input-bar'>
-                                <div className='chat-input-wrap'>
-                                    <input
-                                        value={input}
-                                        onChange={e => setInput(e.target.value)}
-                                        onKeyDown={e => {
-                                            if (e.key === 'Enter' && !sending) handleSend();
-                                        }}
-                                        placeholder={sending ? 'Agent is thinking...' : 'Ask the agent...'}
-                                        disabled={sending}
-                                        autoFocus
-                                    />
-                                    <button className='send-btn'
-                                        onClick={handleSend}
-                                        disabled={sending || !input.trim()}>
-                                        →
-                                    </button>
-                                </div>
-                            </div>
-                        </>
-                    )}
-                </div>
+        <div className='collapse-card'>
+            <div className='collapse-header' onClick={() => setOpen(o => !o)}>
+                <span className='ch-title'>Workflow steps</span>
+                <span className='ch-meta'>
+                    {activeCount} of {localSkills.length} steps active
+                </span>
+                <span className={`chevron ${open ? 'open' : ''}`}>▼</span>
             </div>
+            {open && (
+                <div className='collapse-body open'>
+                    <div className='wf-steps'>
+                        {localSkills.length === 0 && (
+                            <div className='exec-empty'>
+                                No workflow steps configured
+                            </div>
+                        )}
+                        {localSkills.map((s, i) => {
+                            const skillStatus = status?.skills.find(
+                                ss => ss.skill_name === s.skill_name
+                            );
+                            const available = skillStatus?.ds_enabled !== false;
+                            return (
+                                <div key={s.id}
+                                    className='step-row'
+                                    style={{ opacity: s.enabled ? 1 : 0.5 }}>
+                                    <span className='step-num'
+                                        style={!s.enabled ? { background: '#CBD5E1' } : {}}>
+                                        {i + 1}
+                                    </span>
+                                    <span className='step-name'
+                                        style={!s.enabled ? { color: '#9CA3AF' } : {}}>
+                                        {s.skill_display_name}
+                                    </span>
+                                    {s.ds_name && (
+                                        <span className={`ds-badge ${s.ds_name} ${!available ? 'unavailable' : ''}`}>
+                                            {s.ds_name}{!available ? ' ⚠' : ''}
+                                        </span>
+                                    )}
+                                    {s.enabled ? (
+                                        <button
+                                            className='enb on'
+                                            onClick={() => toggleSkill(s)}
+                                            title='Click to disable'>
+                                            On
+                                        </button>
+                                    ) : (
+                                        <button
+                                            className='enb'
+                                            onClick={() => toggleSkill(s)}
+                                            title='Click to enable'>
+                                            Off
+                                        </button>
+                                    )}
+                                </div>
+                            );
+                        })}
+                    </div>
+                    {agentId && (
+                        <div style={{ padding: '6px 14px 8px', borderTop: '0.5px solid #E2E8F0' }}>
+                            <button
+                                className='btn-accent'
+                                style={{ fontSize: 11, padding: '4px 10px' }}
+                                onClick={() => navigate(`/agent/${agentId}`)}>
+                                Edit agent — add · remove · reorder steps
+                            </button>
+                        </div>
+                    )}
+                </div>
+            )}
         </div>
     );
 }
